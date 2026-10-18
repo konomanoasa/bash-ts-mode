@@ -1,4 +1,4 @@
-;;; bash-ts-mode.el --- Tree-sitter mode for Bash 5.3  -*- lexical-binding: t; -*-
+;;; bash-ts-mode.el --- Tree-sitter mode for Bash  -*- lexical-binding: t; -*-
 ;;
 ;; Copyright (C) 2026 konomanoasa
 ;;
@@ -30,7 +30,7 @@
 
 ;;; Commentary:
 ;;
-;; Tree-sitter major mode for Bash 5.3.
+;; Tree-sitter major mode for Bash.
 
 ;;; Code:
 
@@ -45,24 +45,18 @@
 (advice-remove 'bash-ts-mode 'sh--redirect-bash-ts-mode)
 
 (defgroup bash-ts nil
-  "Tree-sitter mode for Bash 5.3."
+  "Tree-sitter mode for Bash."
   :group 'languages)
 
 ;;;; Grammar
 
 (defconst bash-ts-mode--grammar-sources
   '((bash "https://github.com/konomanoasa/tree-sitter-bash"
-          :revision "v0.2.0")
+          :revision "v0.4.0")
     (bash_extglob "https://github.com/konomanoasa/tree-sitter-bash"
-                  :revision "v0.2.0"
-                  :source-dir "bash_extglob/src")
-    (bash_noextquote "https://github.com/konomanoasa/tree-sitter-bash"
-                     :revision "v0.2.0"
-                     :source-dir "bash_noextquote/src")
-    (bash_extglob_noextquote "https://github.com/konomanoasa/tree-sitter-bash"
-                             :revision "v0.2.0"
-                             :source-dir "bash_extglob_noextquote/src"))
-  "Tree-sitter grammar sources for Bash 5.3.")
+                  :revision "v0.4.0"
+                  :source-dir "bash_extglob/src"))
+  "Tree-sitter grammar sources for Bash.")
 
 (defun bash-ts-mode--ensure-grammar (language)
   "Ensure that the grammar for LANGUAGE is installed."
@@ -90,30 +84,110 @@
                        (editorconfig-call-get-properties-function
                         buffer-file-name)))
          (extglob (bash-ts-mode--editorconfig-option
-                   properties 'extglob nil))
-         (extquote (bash-ts-mode--editorconfig-option
-                    properties 'extquote t)))
-    (if extquote
-        (if extglob 'bash_extglob 'bash)
-      (if extglob 'bash_extglob_noextquote 'bash_noextquote))))
+                   properties 'extglob nil)))
+    (if extglob 'bash_extglob 'bash)))
 
-(defun bash-ts-mode--after-change (beg _end old-length)
-  "Reparse a BOM moved to the start by an edit at BEG of OLD-LENGTH."
-  (when (and (= beg 1) (> old-length 0))
+;;;; Incremental Updates
+
+(defconst bash-ts-mode-update--containers
+  '("list")
+  "Container nodes traversed to find an edited source unit.")
+
+(defvar-local bash-ts-mode-update--state nil
+  "Bounds and recovery state captured before a buffer edit.")
+
+(defvar-local bash-ts-mode-update--pending-range nil
+  "Edited owner range awaiting syntax propertization.")
+
+(defun bash-ts-mode-update--bounds (beg end)
+  "Return enclosing source-unit bounds around BEG and END."
+  (let ((start beg)
+        (finish end)
+        (root (treesit-parser-root-node treesit-primary-parser)))
+    (dolist (position (list (max (point-min) (1- beg))
+                            (min (point-max) end)))
+      (let ((node (treesit-node-at position treesit-primary-parser))
+            owner)
+        (while (and node (not (treesit-node-eq node root)))
+          (unless (member (treesit-node-type node)
+                          bash-ts-mode-update--containers)
+            (setq owner node))
+          (setq node (treesit-node-parent node)))
+        (when owner
+          (setq start (min start (treesit-node-start owner))
+                finish (max finish (treesit-node-end owner))))))
+    (cons start finish)))
+
+(defun bash-ts-mode-update--before-change (beg end)
+  "Save owner bounds and old-tree recovery state before changing BEG to END."
+  (when treesit-primary-parser
     (save-restriction
       (widen)
-      (when (eq (char-after 1) #xfeff)
-        (let* ((parser treesit-primary-parser)
-               (language (treesit-parser-language parser))
-               (notifiers (treesit-parser-notifiers parser))
-               (level (treesit-parser-embed-level parser)))
-          (treesit-parser-delete parser)
-          (setq treesit-primary-parser (treesit-parser-create language))
-          (treesit-parser-set-embed-level treesit-primary-parser level)
-          (dolist (notifier notifiers)
-            (treesit-parser-add-notifier treesit-primary-parser notifier))
-          (syntax-ppss-flush-cache 1)
-          (font-lock-flush))))))
+      (setq bash-ts-mode-update--state
+            (cons (bash-ts-mode-update--bounds beg end)
+                  (treesit-node-check
+                   (treesit-parser-root-node treesit-primary-parser)
+                   'has-error))))))
+
+(defun bash-ts-mode-update--reset-parser ()
+  "Replace the primary parser without reusing its old tree."
+  (let* ((parser treesit-primary-parser)
+         (language (treesit-parser-language parser))
+         (tag (treesit-parser-tag parser))
+         (ranges (treesit-parser-included-ranges parser))
+         (notifiers (treesit-parser-notifiers parser))
+         (level (treesit-parser-embed-level parser)))
+    (treesit-parser-delete parser)
+    (setq treesit-primary-parser (treesit-parser-create language nil nil tag))
+    (treesit-parser-set-included-ranges treesit-primary-parser ranges)
+    (treesit-parser-set-embed-level treesit-primary-parser level)
+    (dolist (notifier notifiers)
+      (treesit-parser-add-notifier treesit-primary-parser notifier))))
+
+(defun bash-ts-mode-update--after-change (beg end old-length)
+  "Refresh edited owners and avoid stale trees after BEG, END and OLD-LENGTH."
+  (when treesit-primary-parser
+    (let ((narrowed (buffer-narrowed-p)))
+      (save-restriction
+        (widen)
+        (let* ((state bash-ts-mode-update--state)
+               (reset (or (cdr state)
+                          (and (= beg 1) (> old-length 0)
+                               (eq (char-after 1) #xfeff)))))
+          (setq bash-ts-mode-update--state nil)
+          (when reset (bash-ts-mode-update--reset-parser))
+          (let* ((bounds (if reset (cons (point-min) (point-max))
+                           (bash-ts-mode-update--bounds beg end)))
+                 (start (min (car bounds) (or (caar state) beg)))
+                 (finish (min (point-max)
+                              (max (cdr bounds)
+                                   (+ (or (cdar state) (+ beg old-length))
+                                      (- end beg old-length)))))
+                 (pending bash-ts-mode-update--pending-range)
+                 (pending-end (cdr pending)))
+            (when (and pending-end (>= pending-end beg))
+              (setq pending-end (max end (+ pending-end (- end beg old-length)))))
+            (setq bash-ts-mode-update--pending-range
+                  (cons (min start (or (car pending) start))
+                        (min (point-max) (max finish (or pending-end finish)))))
+            (syntax-ppss-flush-cache start)
+            (font-lock-flush start finish)
+            (when narrowed (syntax-propertize finish))))))))
+
+(defun bash-ts-mode-update--extend-region (start end)
+  "Include edited owners when propertizing START to END."
+  (when bash-ts-mode-update--pending-range
+    (let ((bounds bash-ts-mode-update--pending-range))
+      (setq bash-ts-mode-update--pending-range nil)
+      (cons (max (point-min) (min start (car bounds)))
+            (min (point-max) (max end (cdr bounds)))))))
+
+(defun bash-ts-mode-update--setup ()
+  "Configure incremental updates for the current buffer."
+  (add-hook 'before-change-functions #'bash-ts-mode-update--before-change nil t)
+  (add-hook 'after-change-functions #'bash-ts-mode-update--after-change nil t)
+  (add-hook 'syntax-propertize-extend-region-functions
+            #'bash-ts-mode-update--extend-region nil t))
 
 ;;;; Context
 
@@ -123,7 +197,8 @@
   "Node types that enter shell patterns or static EREs.")
 
 (defconst bash-ts-mode--pattern-boundary-types
-  '("command_substitution_body" "backquote_substitution_body" "list")
+  '("command_substitution_body" "backquote_substitution_body" "list"
+    "here_document_sequence")
   "Node types that start command lists outside a pattern scope.")
 
 (defun bash-ts-mode--pathname-word-p (node)
@@ -296,10 +371,11 @@
                 (process_substitution ["(" ")"] @delimiter)
                 (current_shell_substitution ["{" "}"] @delimiter)
                 (reply_substitution ["{" "}"] @delimiter)
-                (arithmetic_expansion ["(" ")"] @delimiter)
+                (arithmetic_expansion ["(" ")" "[" "]"] @delimiter)
                 (arithmetic_command ["(" ")"] @delimiter)
-                (arithmetic_for_clause "((" @compound-delimiter ")" @delimiter)
-                (conditional_command ["[[" "]]"] @compound-delimiter)
+                (arithmetic_for_clause (arithmetic_for_open) @compound-delimiter
+                                       ")" @delimiter)
+                ([(conditional_open) (conditional_close)] @compound-delimiter)
                 (conditional_group ["(" ")"] @delimiter)
                 (function_definition ["(" ")"] @delimiter)
                 (case_item patterns: (pattern_list "(" @delimiter) ")" @delimiter)
@@ -315,7 +391,7 @@
                 (parenthesized_arithmetic ["(" ")"] @delimiter)
                 (parenthesized_arithmetic_source ["(" ")"] @delimiter))))))
    bash-ts-mode--grammar-sources)
-  "Compiled syntax queries for Bash 5.3.")
+  "Compiled syntax queries for Bash.")
 
 ;;;;; Propertization
 
@@ -794,7 +870,7 @@ Pass ARG to `uncomment-region-default'."
       (extglob_group "|" @font-lock-operator-face)
       (io_file operator: ["<" ">"] @font-lock-operator-face)
       (process_substitution direction: ["<" ">"] @font-lock-operator-face)
-      (parameter_transformation "@" @font-lock-operator-face))
+      (parameter_transformation_operator) @font-lock-operator-face)
 
    :feature 'punctuation
    '(";" @font-lock-punctuation-face
@@ -804,17 +880,18 @@ Pass ARG to `uncomment-region-default'."
      (reply_substitution "$" @font-lock-punctuation-face)
      (arithmetic_expansion "$" @font-lock-punctuation-face)
      (brace_expansion "," @font-lock-punctuation-face)
-     (brace_sequence ".." @font-lock-punctuation-face)
-     (parameter_substring ":" @font-lock-punctuation-face)
-     (parameter_replacement "/" @font-lock-punctuation-face))
+     (brace_sequence_separator) @font-lock-punctuation-face
+     (parameter_substring_separator) @font-lock-punctuation-face
+     (parameter_replacement_separator) @font-lock-punctuation-face)
 
    :feature 'bracket
    '((["(" ")" "{" "}"] @font-lock-bracket-face
       (:pred bash-ts-mode--syntax-delimiter-p @font-lock-bracket-face))
      ((array_subscript ["[" "]"] @font-lock-bracket-face)
       (:pred bash-ts-mode--syntax-delimiter-p @font-lock-bracket-face))
-     (conditional_command ["[[" "]]"] @font-lock-bracket-face)
-     (arithmetic_for_clause "((" @font-lock-bracket-face))
+     (arithmetic_expansion ["[" "]"] @font-lock-bracket-face)
+     [(conditional_open) (conditional_close)] @font-lock-bracket-face
+     (arithmetic_for_open) @font-lock-bracket-face)
 
    :feature 'punctuation
    :override t
@@ -859,7 +936,7 @@ Pass ARG to `uncomment-region-default'."
            (defun ,bash-ts-mode-navigation--function-definition-regexp))))
     (mapcar (lambda (source) (cons (car source) things))
             bash-ts-mode--grammar-sources))
-  "Tree-sitter thing definitions for Bash 5.3.")
+  "Tree-sitter thing definitions for Bash.")
 
 (defun bash-ts-mode-navigation--setup ()
   "Configure navigation for the current buffer."
@@ -878,7 +955,7 @@ Pass ARG to `uncomment-region-default'."
 
 (defconst bash-ts-mode-imenu--settings
   `(("Function" ,bash-ts-mode-navigation--function-definition-regexp nil nil))
-  "Tree-sitter Imenu settings for Bash 5.3.")
+  "Tree-sitter Imenu settings for Bash.")
 
 (defun bash-ts-mode-imenu--setup ()
   "Configure Imenu for the current buffer."
@@ -904,7 +981,7 @@ Pass ARG to `uncomment-region-default'."
 
 (defun bash-ts-mode-indent--closing-delimiter-p (node _parent _bol)
   "Return non-nil when NODE closes a confirmed syntax structure."
-  (and (member (treesit-node-type node) '("}" ")" "]]" "]"))
+  (and (member (treesit-node-type node) '("}" ")" "conditional_close" "]"))
        (bash-ts-mode--syntax-delimiter-p node)))
 
 (defun bash-ts-mode-indent--body (_node parent _bol)
@@ -947,7 +1024,7 @@ Pass ARG to `uncomment-region-default'."
            ((parent-is "program") column-0 0))))
     (mapcar (lambda (source) (cons (car source) rules))
             bash-ts-mode--grammar-sources))
-  "Tree-sitter indentation rules for Bash 5.3.")
+  "Tree-sitter indentation rules for Bash.")
 
 (defun bash-ts-mode-indent--setup ()
   "Configure indentation for the current buffer."
@@ -969,7 +1046,7 @@ Pass ARG to `uncomment-region-default'."
   (bash-ts-mode-imenu--setup)
   (bash-ts-mode-indent--setup)
   (treesit-major-mode-setup)
-  (add-hook 'after-change-functions #'bash-ts-mode--after-change nil t))
+  (bash-ts-mode-update--setup))
 
 ;;;###autoload
 (define-derived-mode bash-ts-mode prog-mode "Bash-TS"

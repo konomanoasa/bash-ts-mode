@@ -49,12 +49,11 @@ Set parsing conditions for matching files in `.editorconfig`.
 ```ini
 [*.bash]
 extglob = false
-extquote = true
 ```
 
-Both properties accept `true` and `false`.
-The defaults are `extglob = false` and `extquote = true`.
-Restart the mode to apply changes.
+`extglob` accepts `true` and `false`, and defaults to `false`.
+Shell options set by `shopt` are not considered. For compatibility, `extglob`
+can be enabled for the entire buffer at mode activation.
 
 ## Grammar
 
